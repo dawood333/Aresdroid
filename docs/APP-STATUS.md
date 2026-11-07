@@ -8,6 +8,7 @@ The repository now contains an Android Studio application module:
 - Ares / MT6893 candidate check. This is a heuristic, not hardware attestation.
 - Storage Access Framework GSI document picker. It retains a read grant when supported; it does not copy, mount, unpack or validate the image.
 - Small arm64 JNI library built with CMake. It reports successful native loading and runs no privileged commands.
+- Root-backed read-only Ares audit: identity/build properties, SELinux mode, self/init namespaces, Binder device visibility, init mount topology, `/data` free space and a non-mutating mount-namespace creation probe. The audit requests KernelSU approval through `su`; it does not change host state.
 - Session-switch control is deliberately disabled.
 
 ## Build environment
@@ -16,9 +17,9 @@ Open the repository in Android Studio with JDK 17, Android SDK Platform 36, Andr
 
 ## Not implemented
 
-- Root command broker or privileged daemon.
+- Persistent root command broker or privileged daemon (the audit uses one fixed, bounded `su -c` request only).
 - GSI staging, copying, hashing or filesystem inspection.
-- Namespace creation or pivot_root.
+- A disposable `pivot_root` test. The current namespace probe only attempts creation of a separate mount namespace and reports the result; it does not mount or pivot anything.
 - Binder/service-manager isolation or ownership handling.
 - Zygote or system_server control.
 - Recovery controller and session switching.
@@ -26,3 +27,7 @@ Open the repository in Android Studio with JDK 17, Android SDK Platform 36, Andr
 ## Safety
 
 The app requests no broad storage permissions, does not change SELinux, and does not stop or signal Android host services. The disabled switch control must remain disabled until the Ares-specific recovery path and bring-up gates are demonstrated.
+
+## M0/M1 audit behavior
+
+The dashboard now has a **Run privileged Ares audit** action. It collects a bounded text report after the user approves the KernelSU prompt. Commands are fixed in the app; no arbitrary shell input is accepted. The only namespace operation is a child mount-namespace creation attempt (`unshare -m`) with no mount changes. A failed or unavailable probe is reported, not bypassed. The report is intended to decide the next Ares-specific M1 experiment; it is not evidence that pivot_root or Android guest startup works.
