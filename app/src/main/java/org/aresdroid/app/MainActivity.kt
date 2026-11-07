@@ -3,6 +3,7 @@ package org.aresdroid.app
 import androidx.activity.ComponentActivity
 import android.content.Intent
 import android.graphics.Typeface
+import android.app.AlertDialog
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
@@ -94,6 +95,8 @@ class MainActivity : ComponentActivity() {
         gsiStatus = label("No image selected. Choose a system image to copy, hash and inspect it offline.")
         image.addView(gsiStatus)
         image.addView(actionButton("Choose GSI image") { openGsi.launch(arrayOf("*/*")) })
+        image.addView(actionButton("View staged images") { showStagedImages() })
+        image.addView(actionButton("Remove staged images") { confirmClearStagedImages() })
 
         content.addView(sectionTitle("RUNTIME"))
         val runtime = card(content)
@@ -245,6 +248,46 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
+    private fun showStagedImages() {
+        val dir = File(filesDir, "gsi-staging")
+        val images = dir.listFiles { file -> file.isFile && file.extension == "img" }
+            ?.sortedByDescending { it.lastModified() }.orEmpty()
+        if (images.isEmpty()) {
+            gsiStatus.text = "No validated images are currently staged."
+            return
+        }
+        gsiStatus.text = buildString {
+            appendLine("STAGED GSI IMAGES (${images.size})")
+            images.forEachIndexed { index, file ->
+                appendLine()
+                appendLine("${index + 1}. ${file.name}")
+                appendLine("Size: ${formatSize(file.length())}")
+                appendLine("Modified: ${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(file.lastModified()))}")
+            }
+            append("Stored in app-private storage. These images have not been mounted or boot-tested.")
+        }
+    }
+
+    private fun confirmClearStagedImages() {
+        val dir = File(filesDir, "gsi-staging")
+        val count = dir.listFiles { file -> file.isFile && (file.extension == "img" || file.extension == "part") }
+            ?.size ?: 0
+        if (count == 0) {
+            gsiStatus.text = "Staging is already empty."
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Remove staged images?")
+            .setMessage("Delete $count staged image file(s) from AresDroid private storage? Original files will not be affected.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Remove") { _, _ ->
+                val removed = dir.listFiles { file ->
+                    file.isFile && (file.extension == "img" || file.extension == "part")
+                }?.count { it.delete() } ?: 0
+                gsiStatus.text = "Removed $removed staged image file(s). Original source files were not changed."
+            }
+            .show()
+    }
     private data class ImageCheck(
         val valid: Boolean,
         val name: String,
