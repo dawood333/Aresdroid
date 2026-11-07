@@ -244,10 +244,17 @@ class MainActivity : ComponentActivity() {
                     if (!raw.exists()) expandSparseImage(staged, raw, expandedBytes)
                     rawPath = raw.absolutePath
                 }
-                val imageInspection = inspectMountedGsi(rawPath, format.name)
+                // Sparse is a transport container, not a filesystem type. Detect the
+                // expanded payload again so EROFS sparse GSIs are not mounted as ext4.
+                val rawFormat = if (format.name == "Android sparse image") {
+                    inspectSystemImage(File(rawPath)).takeIf { it.valid }
+                        ?: throw IllegalArgumentException("Expanded sparse payload is not a supported ext4/EROFS filesystem")
+                } else format
+                val imageInspection = inspectMountedGsi(rawPath, rawFormat.name)
                 result = buildString {
                     appendLine("GSI image staged successfully")
-                    appendLine("Format: ${format.name}")
+                    appendLine("Container format: ${format.name}")
+                    appendLine("Filesystem: ${rawFormat.name}")
                     appendLine("File size: ${formatSize(total)}")
                     appendLine("Expanded size: ${format.expandedSize?.let { formatSize(it) } ?: "Not applicable"}")
                     appendLine("SHA-256: $sha256")
@@ -436,16 +443,35 @@ class MainActivity : ComponentActivity() {
         """.trimIndent()
         return try {
             val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
-            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+            // Drain output while the command runs. Waiting first can deadlock if
+            // diagnostics fill the process pipe before the child exits.
+            val output = StringBuilder()
+            val reader = Thread {
+                runCatching {
+                    process.inputStream.bufferedReader().useLines { lines ->
+                        lines.forEach { line ->
+                            synchronized(output) {
+                                if (output.length < 9000) output.append(line).append('\n')
+                            }
+                        }
+                    }
+                }
+            }.apply { isDaemon = true; start() }
+            val completed = process.waitFor(30, TimeUnit.SECONDS)
+            if (!completed) {
                 process.destroyForcibly()
-                "Inspection timed out."
+                process.waitFor(2, TimeUnit.SECONDS)
+                reader.join(2000)
+                "Inspection timed out after 30 seconds."
             } else {
-                val output = process.inputStream.bufferedReader().use { it.readText() }.take(9000)
-                if (process.exitValue() == 0) output.ifBlank { "No metadata was found in the image." }
-                else "Read-only mount/inspection unavailable (exit ${process.exitValue()}):\n$output"
+                reader.join(2000)
+                val captured = synchronized(output) { output.toString().take(9000) }
+                if (process.exitValue() == 0) captured.ifBlank { "No metadata was found in the image." }
+                else "Read-only mount/inspection unavailable (exit \${process.exitValue()}):\n$captured"
             }
         } catch (error: Exception) {
-            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+            "Could not inspect image as root: \${error.javaClass.simpleName}: \${error.message}"
+        }
         }
     }
 
