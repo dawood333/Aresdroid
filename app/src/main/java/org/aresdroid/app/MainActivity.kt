@@ -17,10 +17,13 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
     private lateinit var gsiStatus: TextView
     private var nativeStatusText = "Native core not checked"
+    private lateinit var auditStatus: TextView
+    private var auditRunning = false
 
     private val openGsi = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri != null) {
@@ -93,7 +96,10 @@ class MainActivity : ComponentActivity() {
         content.addView(sectionTitle("RUNTIME"))
         val runtime = card(content)
         runtime.addView(label(nativeStatusText))
-        runtime.addView(label("Session switching is locked during safety and recovery bring-up."))
+        runtime.addView(label("Root-backed, read-only Ares audit. It does not change mounts, services, properties or SELinux."))
+        runtime.addView(actionButton("Run privileged Ares audit") { runAresAudit() })
+        auditStatus = label("Audit not run yet. Tap the button and approve the KernelSU prompt.")
+        runtime.addView(auditStatus)
         runtime.addView(Button(this).apply {
             text = "Switch Android session — locked"
             isEnabled = false
@@ -116,6 +122,73 @@ class MainActivity : ComponentActivity() {
             textSize = 11f
         })
         setContentView(root)
+    }
+
+    private fun runAresAudit() {
+        if (auditRunning) return
+        auditRunning = true
+        auditStatus.text = "Requesting root and collecting read-only diagnostics…"
+        Thread {
+            val script = """
+                echo '=== AresDroid M0 / M1 preflight ==='
+                echo '[identity]'
+                id
+                echo "device=$(getprop ro.product.device)"
+                echo "model=$(getprop ro.product.model)"
+                echo "hardware=$(getprop ro.hardware)"
+                echo "soc=$(getprop ro.soc.model)"
+                echo "android=$(getprop ro.build.version.release) sdk=$(getprop ro.build.version.sdk)"
+                echo "fingerprint=$(getprop ro.build.fingerprint)"
+                echo "vendor_api=$(getprop ro.vndk.version)"
+                echo "kernel=$(uname -a)"
+                echo '[security]'
+                printf 'selinux_enforce='
+                cat /sys/fs/selinux/enforce 2>/dev/null || echo unavailable
+                echo '[namespaces]'
+                for ns in mnt pid ipc net uts user cgroup; do
+                    printf '%s self=' "$ns"; readlink "/proc/self/ns/$ns" 2>/dev/null || echo unavailable
+                    printf '%s init=' "$ns"; readlink "/proc/1/ns/$ns" 2>/dev/null || echo unavailable
+                done
+                echo '[namespace-tools]'
+                command -v unshare 2>/dev/null || echo 'unshare: unavailable'
+                command -v nsenter 2>/dev/null || echo 'nsenter: unavailable'
+                command -v pivot_root 2>/dev/null || echo 'pivot_root: unavailable'
+                echo '[binder]'
+                ls -l /dev/binder /dev/hwbinder /dev/vndbinder /dev/binderfs 2>&1
+                grep -E 'binder|binderfs' /proc/1/mountinfo 2>/dev/null | head -n 20
+                echo '[mount-propagation]'
+                grep -E ' /data | / | /dev ' /proc/1/mountinfo 2>/dev/null | head -n 20
+                echo '[storage]'
+                df -h /data 2>&1
+                echo '[isolated-mount-namespace-test]'
+                if command -v unshare >/dev/null 2>&1; then
+                    unshare -m sh -c 'echo "unshare_mount_namespace=created"; printf "child="; readlink /proc/self/ns/mnt; printf "init="; readlink /proc/1/ns/mnt' 2>&1
+                    echo "unshare_exit=$?"
+                else
+                    echo 'unshare_test=SKIPPED (no unshare executable)'
+                fi
+                echo '=== End of read-only audit ==='
+            """.trimIndent()
+            var report: String
+            try {
+                val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+                val completed = process.waitFor(25, TimeUnit.SECONDS)
+                if (!completed) {
+                    process.destroyForcibly()
+                    report = "Root audit timed out after 25 seconds."
+                } else {
+                    report = process.inputStream.bufferedReader().use { it.readText() }
+                    if (report.length > 14000) report = report.take(14000) + "\n[output truncated]"
+                    if (process.exitValue() != 0) report += "\n[su exit=${process.exitValue()}]"
+                }
+            } catch (error: Exception) {
+                report = "Could not start root audit: ${error.javaClass.simpleName}: ${error.message}"
+            }
+            runOnUiThread {
+                auditStatus.text = report
+                auditRunning = false
+            }
+        }.start()
     }
 
     private fun showSelectedImage(uri: Uri) {
