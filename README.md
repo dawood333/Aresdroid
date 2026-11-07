@@ -1,65 +1,34 @@
 # AresDroid
 
-An experimental, device-specific Android guest-runtime project for Xiaomi Ares
-(MediaTek MT6893). The long-term goal is to run a second Android userspace
-alongside the installed host OS and provide a recoverable switch-back path,
-without flashing a second boot image.
+An experimental, device-specific Android userspace switcher for Xiaomi Ares (MediaTek MT6893).
 
-> **Status: research / bring-up only.** Nothing in this repository currently
-> switches Android sessions. Do not use it to stop `zygote`, `system_server`,
-> `surfaceflinger`, alter SELinux mode, or change watchdog state.
+> **Status: app bootstrap / read-only bring-up.** The Android application is scaffolded. It does not switch Android sessions; guest handoff remains disabled.
+
+## Android application
+
+The initial Android app is a Kotlin + Jetpack Compose project:
+- Device dashboard for model, codename, platform, Android SDK and kernel.
+- Read-only SELinux, root, BinderFS and /data inventory.
+- No special Android permissions are requested.
+- No host framework services are stopped.
+- No SELinux, watchdog, boot, vendor, dtbo or super state is modified.
+
+Build a debug APK with Gradle 8.9 and JDK 17:
+
+    gradle --no-daemon :app:assembleDebug
+
+GitHub Actions builds and uploads the debug APK on pushes to the application branch.
 
 ## Target
-
 - Device: Xiaomi Ares
-- SoC: MediaTek MT6893 (`mediatek,MT6893`)
+- SoC: MediaTek MT6893 (mediatek,MT6893)
 - Architecture: arm64
-- Host: Android-based Xiaomi firmware
-- Root: KernelSU environment (must be detected, not assumed)
-- Kernel: device-specific; collect the running kernel release at probe time
+- Root: KernelSU environment (detected at runtime, never assumed)
 
-## Design principles
+## Runtime direction
 
-1. **Read-only first.** Initial device probing must not change system state.
-2. **Host remains authoritative.** The host init, vendor services, radio,
-   thermal stack and kernel remain in control.
-3. **No Samsung assumptions.** No One UI framework patches, Samsung watchdog
-   paths, Samsung property handling, or Samsung-specific service names.
-4. **Fail closed.** Unknown Binder, mount, SELinux, watchdog or vendor state
-   means "unsupported for now", not "try anyway".
-5. **Recoverability before guest boot.** A tested return path and external
-   recovery procedure are prerequisites for any takeover experiment.
-6. **No kernel modifications in phase 1.** First establish whether the existing
-   Ares kernel exposes the required Linux primitives.
+AresDroid follows the high-level hot-userspace-switch model studied in OneOS. OneOS remains the architectural reference; AnyGSI is an additional implementation reference. The implementation is clean-room and does not copy upstream switcher scripts.
 
-## Repository map
+The first release is deliberately limited to device inspection. Image staging, namespace tests, Binder/service ownership, guest bootstrap and recovery are separate milestones. The switch action must not be enabled until recovery and isolation have been demonstrated on the exact Ares build.
 
-- `scripts/ares-probe.sh` — read-only device inventory; safe to run from Termux.
-- `docs/ARCHITECTURE.md` — proposed runtime boundaries.
-- `docs/BRINGUP.md` — staged test plan and go/no-go gates.
-- `docs/DEVICE-DATA.md` — facts to collect from the actual phone.
-- `docs/SAFETY.md` — prohibited operations and recovery requirements.
-
-## First test
-
-From the repository root (or after extracting the script), run:
-
-```sh
-su -c 'sh scripts/ares-probe.sh'
-```
-
-Copy the generated report back for review. The probe intentionally does not
-mount images, create loop devices, stop Android services, write watchdog nodes,
-or change SELinux.
-
-## Legal / provenance
-
-This is a clean-room implementation plan. It does not copy OneOS or OneLineage
-switcher code. Review upstream notices and licenses before reusing any code,
-patches, assets, or binaries. See `docs/PROVENANCE.md`.
-
-## Current milestone
-
-**M0 — device capability inventory.** No guest image should be prepared until
-the Ares report confirms the necessary primitives and the host/vendor layout
-is understood.
+See docs/ARCHITECTURE.md, docs/BRINGUP.md, docs/SAFETY.md and docs/PROVENANCE.md.
