@@ -397,8 +397,8 @@ class MainActivity : ComponentActivity() {
                 echo "mount=success"
                 for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do
                     if [ -f "${'$'}MNT/${'$'}f" ]; then
-                        echo "=== $f ==="
-                        if [ "$f" = build.prop ]; then
+                        echo "=== ${'$'}f ==="
+                        if [ "${'$'}f" = build.prop ]; then
                             grep -E "^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=" "${'$'}MNT/${'$'}f" | head -n 40 || true
                         else
                             head -n 160 "${'$'}MNT/${'$'}f"
@@ -407,7 +407,7 @@ class MainActivity : ComponentActivity() {
                         echo "missing=${'$'}f"
                     fi
                 done
-            ' aresdroid \${quote(imagePath)} \${quote(mountDir.absolutePath)} \${quote(fsType)}
+            ' aresdroid ${quote(imagePath)} ${quote(mountDir.absolutePath)} ${quote(fsType)}
         """.trimIndent()
         return try {
             val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
