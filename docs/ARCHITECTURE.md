@@ -22,7 +22,7 @@ Do not describe the guest as Binder-isolated until a separate context manager an
 ## Components
 
 1. **Probe layer** — read-only inventory of kernel configuration, mount topology, Binder devices and contexts, service-manager ownership, SELinux, watchdogs, APEX, VINTF/HALs and host build identity.
-2. **Image staging** — future component; validates image format, filesystem, free space, hashes, image/host compatibility and rollback metadata. Not implemented.
+2. **Image staging and guest manifest** — implemented for a single ext4/EROFS system image: validates raw/sparse container structure, expands sparse images, hashes the staged payload, mounts it read-only in a disposable mount namespace for metadata inspection, and writes `gsi-staging/guest-session.json` with host identity, target MT6893 identity, exact image hashes and explicit handoff prerequisites. This manifest is an integrity record, not a bootable guest rootfs.
 3. **Namespace and rootfs builder** — future component; creates a private mount view and exposes only reviewed host interfaces. Must prevent guest writes to host data and block-backed mounts. Not implemented.
 4. **Host handoff controller** — future component; models the host framework stop/start sequence only after the recovery path is proven. Disabled during bring-up.
 5. **Guest bootstrap** — future component; prepares the guest runtime environment, classpaths, APEX view, zygote sockets and selected Android services. Not implemented.
