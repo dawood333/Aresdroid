@@ -132,3 +132,98 @@ These facts do **not** yet establish:
 - app-android/core/model/src/main/kotlin/com/fahadali/oneos/core/model/Profiles.kt
 
 Upstream source: https://github.com/fahadalijaved/OneOS
+
+
+## 8. Upstream licensing and clean-room boundary (verified 2026-11-07)
+
+The upstream repository has an Apache-2.0 LICENSE, but that file must not be
+read as blanket permission for every path in the repository. Its root NOTICE
+states that the session scripts under `switcher/assets/` started from
+OneLineage by WeWaffles, that OneLineage has no license, and that written
+permission was granted to publish OneOS on top of it with credit. The NOTICE
+explicitly says that this permission is not a license to reuse those
+OneLineage-derived parts elsewhere.
+
+Consequences for AresDroid:
+
+- Do not copy, fork, translate, mechanically rewrite, or adapt the
+  OneLineage-derived scripts in `switcher/assets/` into AresDroid unless
+  separate permission/license covering that reuse is obtained.
+- Do not treat OneOS's Apache-2.0 root LICENSE as overriding the path-specific
+  NOTICE or third-party terms.
+- Use upstream documentation and observed behavior as architectural research.
+  Implement AresDroid's scripts and runtime independently, with its own
+  design, tests, and provenance.
+- Before reusing any non-script file (including native code, Kotlin, patches,
+  overlays, assets or binaries), inspect its copyright headers, NOTICE/CREDITS
+  entries and applicable license individually. No blanket reuse approval is
+  inferred here.
+- Keep attribution for concepts/research references clear, but do not imply
+  that attribution alone grants copyright permission.
+
+This is an engineering provenance note, not legal advice. Upstream references:
+- OneOS LICENSE: https://github.com/fahadalijaved/OneOS/blob/main/LICENSE
+- OneOS NOTICE: https://github.com/fahadalijaved/OneOS/blob/main/NOTICE
+- OneOS CREDITS: https://github.com/fahadalijaved/OneOS/blob/main/CREDITS.md
+
+## 9. Additional implementation facts confirmed from upstream source
+
+The source review confirms several details that should shape the independent
+Ares implementation:
+
+- The switch script requires the caller to be in PID 1's mount namespace.
+  This is deliberate: OneOS creates selected data bridges there because host
+  installd/artd use that namespace. AresDroid must measure its own namespace
+  topology and must not assume KernelSU's shell is already in init's namespace.
+- The guest preparation code performs extensive symlink and mount checks
+  before recursively changing staged data. This is a critical safety property:
+  a guest-controlled symlink below the stage could redirect host-side
+  cleanup/chown/relabel operations into real host data.
+- The guest launcher exports classpaths derived from the guest image rather
+  than blindly inheriting host BOOTCLASSPATH and SYSTEMSERVERCLASSPATH.
+  AresDroid must derive and validate guest runtime paths for the exact guest
+  image and Android release.
+- The guest zygote sockets live under the shared `/dev/socket` tree in the
+  OneOS design. Host init can unlink/recreate those paths if its zygote is
+  restarted. AresDroid must explicitly model socket path ownership and init
+  onrestart behavior; a separate PID or mount namespace alone does not
+  isolate a shared socket filesystem.
+- OneOS's documented in-place return is conditional on a detailed baseline
+  (boot ID, properties, SELinux mode, APEX devices, service PIDs, mounts,
+  linker configuration and kernel-log marker) and multiple gates. It falls
+  back to reboot when checks fail. This is not a generic return script that
+  can be transplanted to Ares.
+- The current MediaTek profile in upstream is Galaxy A07 / MT6789, Android 17,
+  vendor API 31 and kernel 6.12. This is materially different from Ares
+  MT6893 and its observed Android 16 / vendor API 30 / kernel 4.14.x
+  environment. It demonstrates only that OneOS has begun device-specific
+  MediaTek adaptation; it does not validate Ares.
+
+## 10. Updated AresDroid implementation gates
+
+The next work is an independent, staged implementation—not a port of the
+upstream shell scripts:
+
+1. **M0 closeout:** capture one internally consistent Ares report and resolve
+   conflicting host identity properties (including build fingerprint,
+   Android release/API and vendor API).
+2. **M1 namespace laboratory:** use a disposable directory on writable
+   `/data`; test namespace creation, mount propagation and pivot_root with
+   no host service changes and no host data mounts exposed writable.
+3. **M2 Android interface inventory:** map Binder devices/context managers,
+   servicemanager ownership, init service definitions, zygote sockets,
+   property service, APEX and VINTF/HALs. Linux IPC namespaces do not by
+   themselves create an independent Android Binder context manager.
+4. **M3 guest-image compatibility:** inspect the exact guest image offline;
+   validate API/vendor compatibility, linker namespaces, APEX requirements,
+   classpaths, VINTF and framework service dependencies.
+5. **M4 recovery engineering:** design and test an Ares-specific recovery
+   controller while the host framework is still running. Prove a forced
+   reboot/recovery route independently before considering a handoff.
+6. **M5 supervised framework experiment:** only after the preceding gates
+   pass, consider a controlled guest bootstrap with explicit service
+   ownership and a tested return path.
+
+Until then, all AresDroid runtime actions remain disabled. No host zygote,
+system_server, SurfaceFlinger, vold, installd, property service, watchdog or
+SELinux state is to be changed by bring-up scripts.
