@@ -7,6 +7,7 @@ import android.app.AlertDialog
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
+import android.os.StatFs
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.Gravity
@@ -232,14 +233,26 @@ class MainActivity : ComponentActivity() {
                 val staged = File(stageDir, "$sha256.img")
                 if (staged.exists()) temp.delete()
                 else if (!temp.renameTo(staged)) throw IllegalStateException("Could not finalize staged image")
+                var rawPath = staged.absolutePath
+                if (format.name == "Android sparse image") {
+                    val expandedBytes = format.expandedSize ?: throw IllegalStateException("Sparse expanded size is missing")
+                    val available = StatFs(stageDir.absolutePath).availableBytes
+                    if (expandedBytes > available - 512L * 1024L * 1024L) {
+                        throw IllegalStateException("Not enough free space to expand image safely")
+                    }
+                    val raw = File(stageDir, "$sha256.raw")
+                    if (!raw.exists()) expandSparseImage(staged, raw, expandedBytes)
+                    rawPath = raw.absolutePath
+                }
                 result = buildString {
                     appendLine("GSI image staged successfully")
                     appendLine("Format: ${format.name}")
                     appendLine("File size: ${formatSize(total)}")
                     appendLine("Expanded size: ${format.expandedSize?.let { formatSize(it) } ?: "Not applicable"}")
                     appendLine("SHA-256: $sha256")
-                    appendLine("Private path: ${staged.absolutePath}")
-                    append("Status: offline structure check passed; image is not mounted or boot-tested.")
+                    appendLine("Source image: ${staged.absolutePath}")
+                    appendLine("Mountable raw candidate: $rawPath")
+                    append("Status: image structure checked and staged; Android compatibility and boot have not been tested.")
                 }
             } catch (error: Exception) {
                 result = "GSI validation failed: ${error.javaClass.simpleName}: ${error.message ?: "unknown error"}"
@@ -349,6 +362,63 @@ class MainActivity : ComponentActivity() {
         }
         val expanded = totalBlocks * blockSize
         return ImageCheck(true, "Android sparse image", "Sparse header and chunk table validated", expanded)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
     }
 
     private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
