@@ -16,6 +16,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
+import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
@@ -32,7 +34,7 @@ class MainActivity : ComponentActivity() {
             } catch (_: SecurityException) {
                 // The selected provider may not support persistable grants.
             }
-            showSelectedImage(uri)
+            validateAndStageImage(uri)
         }
     }
 
@@ -89,7 +91,7 @@ class MainActivity : ComponentActivity() {
 
         content.addView(sectionTitle("GUEST IMAGE"))
         val image = card(content)
-        gsiStatus = label("No image selected. Selection does not install or validate a GSI.")
+        gsiStatus = label("No image selected. Choose a system image to copy, hash and inspect it offline.")
         image.addView(gsiStatus)
         image.addView(actionButton("Choose GSI image") { openGsi.launch(arrayOf("*/*")) })
 
@@ -191,19 +193,150 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun showSelectedImage(uri: Uri) {
-        var name = uri.lastPathSegment ?: "Selected document"
-        var size: Long? = null
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
-            ?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    if (nameIndex >= 0) name = cursor.getString(nameIndex) ?: name
-                    if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+    private fun validateAndStageImage(uri: Uri) {
+        gsiStatus.text = "Copying selected image into private staging and calculating SHA-256…"
+        Thread {
+            var result: String
+            try {
+                val stageDir = File(filesDir, "gsi-staging")
+                if (!stageDir.exists() && !stageDir.mkdirs()) {
+                    throw IllegalStateException("Cannot create private staging directory")
                 }
+                val temp = File(stageDir, "incoming-\${System.currentTimeMillis()}.part")
+                val digest = MessageDigest.getInstance("SHA-256")
+                var total = 0L
+                contentResolver.openInputStream(uri)?.use { input ->
+                    temp.outputStream().buffered(128 * 1024).use { output ->
+                        val buffer = ByteArray(128 * 1024)
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                            digest.update(buffer, 0, count)
+                            total += count
+                        }
+                    }
+                } ?: throw IllegalStateException("The selected document provider returned no stream")
+
+                if (total < 4096L) throw IllegalArgumentException("Image is too small to be a system image")
+                val sha256 = digest.digest().joinToString("") { "%02x".format(it) }
+                val format = inspectSystemImage(temp)
+                if (!format.valid) {
+                    temp.delete()
+                    throw IllegalArgumentException(format.message)
+                }
+
+                val staged = File(stageDir, "$sha256.img")
+                if (staged.exists()) temp.delete()
+                else if (!temp.renameTo(staged)) throw IllegalStateException("Could not finalize staged image")
+                result = buildString {
+                    appendLine("GSI image staged successfully")
+                    appendLine("Format: \${format.name}")
+                    appendLine("File size: \${formatSize(total)}")
+                    appendLine("Expanded size: \${format.expandedSize?.let { formatSize(it) } ?: "Not applicable"}")
+                    appendLine("SHA-256: $sha256")
+                    appendLine("Private path: \${staged.absolutePath}")
+                    append("Status: offline structure check passed; image is not mounted or boot-tested.")
+                }
+            } catch (error: Exception) {
+                result = "GSI validation failed: \${error.javaClass.simpleName}: \${error.message ?: "unknown error"}"
             }
-        gsiStatus.text = "Selected: $name\nSize: ${formatSize(size)}\nNot copied, inspected or validated yet."
+            runOnUiThread { gsiStatus.text = result }
+        }.start()
+    }
+
+    private data class ImageCheck(
+        val valid: Boolean,
+        val name: String,
+        val message: String,
+        val expandedSize: Long? = null
+    )
+
+    private fun inspectSystemImage(file: File): ImageCheck {
+        RandomAccessFile(file, "r").use { image ->
+            if (image.length() < 4L) return ImageCheck(false, "Unknown", "Truncated image")
+            val magic = readLeInt(image, 0)
+            if (magic == 0xED26FF3A.toInt()) return inspectAndroidSparse(image)
+            if (image.length() >= 1082L && readLeShort(image, 1080) == 0xEF53) {
+                return ImageCheck(true, "Raw ext4", "ext4 superblock magic found")
+            }
+            if (image.length() >= 1028L && readLeInt(image, 1024) == 0xE0F5E1E2.toInt()) {
+                return ImageCheck(true, "Raw EROFS", "EROFS superblock magic found")
+            }
+            return ImageCheck(false, "Unknown", "Unsupported format: expected Android sparse, raw ext4 or raw EROFS system image")
+        }
+    }
+
+    private fun inspectAndroidSparse(image: RandomAccessFile): ImageCheck {
+        if (image.length() < 28L) return ImageCheck(false, "Android sparse", "Truncated sparse header")
+        val major = readLeShort(image, 4)
+        val fileHeaderSize = readLeShort(image, 8)
+        val chunkHeaderSize = readLeShort(image, 10)
+        val blockSize = readLeInt(image, 12).toLong() and 0xFFFFFFFFL
+        val totalBlocks = readLeInt(image, 16).toLong() and 0xFFFFFFFFL
+        val totalChunks = readLeInt(image, 20).toLong() and 0xFFFFFFFFL
+        if (major != 1 || fileHeaderSize < 28 || chunkHeaderSize < 12 ||
+            blockSize == 0L || totalBlocks == 0L || totalChunks > 1_000_000L
+        ) return ImageCheck(false, "Android sparse", "Invalid or unsupported sparse header")
+
+        var offset = fileHeaderSize.toLong()
+        var blocksSeen = 0L
+        repeat(totalChunks.toInt()) {
+            if (offset + chunkHeaderSize > image.length()) {
+                return ImageCheck(false, "Android sparse", "Truncated chunk header")
+            }
+            val type = readLeShort(image, offset)
+            val chunkBlocks = readLeInt(image, offset + 4).toLong() and 0xFFFFFFFFL
+            val totalSize = readLeInt(image, offset + 8).toLong() and 0xFFFFFFFFL
+            val payload = when (type) {
+                0xCAC1 -> chunkBlocks * blockSize
+                0xCAC2 -> 4L
+                0xCAC3 -> 0L
+                0xCAC4 -> 4L
+                else -> return ImageCheck(false, "Android sparse", "Unknown sparse chunk type 0x\${type.toString(16)}")
+            }
+            if (totalSize != chunkHeaderSize + payload || offset + totalSize > image.length()) {
+                return ImageCheck(false, "Android sparse", "Invalid or truncated sparse chunk")
+            }
+            if (type != 0xCAC4) blocksSeen += chunkBlocks
+            offset += totalSize
+        }
+        if (blocksSeen != totalBlocks || offset != image.length()) {
+            return ImageCheck(false, "Android sparse", "Sparse chunk table does not match header or file length")
+        }
+        val expanded = totalBlocks * blockSize
+        return ImageCheck(true, "Android sparse image", "Sparse header and chunk table validated", expanded)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
     }
 
     private fun aresTargetStatus(): String {
