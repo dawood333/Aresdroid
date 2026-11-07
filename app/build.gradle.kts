@@ -46,7 +46,9 @@ val packagePivotLab by tasks.registering(Copy::class) {
         if (matches.isEmpty()) throw GradleException("NDK pivot lab executable was not produced")
     }
 }
-tasks.named("mergeDebugAssets").configure { dependsOn(packagePivotLab) }
+tasks.configureEach {
+    if (name == "mergeDebugAssets") dependsOn(packagePivotLab)
+}
 
 dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
