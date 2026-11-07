@@ -27,7 +27,26 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+    sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/pivotLabAssets"))
 }
+
+// Package the NDK-built standalone executable as an APK asset. The app copies
+// it to /data/local/tmp and runs it only under unshare -m.
+val packagePivotLab by tasks.registering(Copy::class) {
+    dependsOn("externalNativeBuildDebug")
+    from(fileTree(layout.buildDirectory.dir("intermediates/cxx/Debug")) {
+        include("**/aresdroid-pivot-lab")
+    })
+    into(layout.buildDirectory.dir("generated/pivotLabAssets"))
+    rename { "aresdroid-pivot-lab" }
+    doFirst {
+        val matches = fileTree(layout.buildDirectory.dir("intermediates/cxx/Debug")) {
+            include("**/aresdroid-pivot-lab")
+        }.files
+        if (matches.isEmpty()) throw GradleException("NDK pivot lab executable was not produced")
+    }
+}
+tasks.named("mergeDebugAssets").configure { dependsOn(packagePivotLab) }
 
 dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
