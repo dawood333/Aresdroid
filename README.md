@@ -27,7 +27,7 @@ The first app version displays device and security information, allows the user 
 
 ## Build
 
-Open the repository in Android Studio with JDK 17, Android SDK Platform 36, Android NDK and CMake 3.22.1. The project uses Android Gradle Plugin 8.7.3 and Kotlin 2.0.21. Gradle 8.9 is required. A Gradle wrapper is not committed yet.
+Open the repository in Android Studio with JDK 17, Android SDK Platform 36, Android NDK and CMake 3.22.1. The project uses Android Gradle Plugin 8.10.0 and Kotlin 2.0.21. Gradle 8.11.1 is required. A Gradle wrapper is not committed yet.
 
 ## Design principles
 
