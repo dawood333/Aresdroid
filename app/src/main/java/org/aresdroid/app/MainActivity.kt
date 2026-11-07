@@ -527,7 +527,6 @@ class MainActivity : ComponentActivity() {
         } catch (error: Exception) {
             "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
         }
-        }
     }
 
     private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
