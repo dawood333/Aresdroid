@@ -202,7 +202,7 @@ class MainActivity : ComponentActivity() {
                 if (!stageDir.exists() && !stageDir.mkdirs()) {
                     throw IllegalStateException("Cannot create private staging directory")
                 }
-                val temp = File(stageDir, "incoming-\${System.currentTimeMillis()}.part")
+                val temp = File(stageDir, "incoming-${System.currentTimeMillis()}.part")
                 val digest = MessageDigest.getInstance("SHA-256")
                 var total = 0L
                 contentResolver.openInputStream(uri)?.use { input ->
@@ -231,15 +231,15 @@ class MainActivity : ComponentActivity() {
                 else if (!temp.renameTo(staged)) throw IllegalStateException("Could not finalize staged image")
                 result = buildString {
                     appendLine("GSI image staged successfully")
-                    appendLine("Format: \${format.name}")
-                    appendLine("File size: \${formatSize(total)}")
-                    appendLine("Expanded size: \${format.expandedSize?.let { formatSize(it) } ?: "Not applicable"}")
+                    appendLine("Format: ${format.name}")
+                    appendLine("File size: ${formatSize(total)}")
+                    appendLine("Expanded size: ${format.expandedSize?.let { formatSize(it) } ?: "Not applicable"}")
                     appendLine("SHA-256: $sha256")
-                    appendLine("Private path: \${staged.absolutePath}")
+                    appendLine("Private path: ${staged.absolutePath}")
                     append("Status: offline structure check passed; image is not mounted or boot-tested.")
                 }
             } catch (error: Exception) {
-                result = "GSI validation failed: \${error.javaClass.simpleName}: \${error.message ?: "unknown error"}"
+                result = "GSI validation failed: ${error.javaClass.simpleName}: ${error.message ?: "unknown error"}"
             }
             runOnUiThread { gsiStatus.text = result }
         }.start()
@@ -293,7 +293,7 @@ class MainActivity : ComponentActivity() {
                 0xCAC2 -> 4L
                 0xCAC3 -> 0L
                 0xCAC4 -> 4L
-                else -> return ImageCheck(false, "Android sparse", "Unknown sparse chunk type 0x\${type.toString(16)}")
+                else -> return ImageCheck(false, "Android sparse", "Unknown sparse chunk type 0x${type.toString(16)}")
             }
             if (totalSize != chunkHeaderSize + payload || offset + totalSize > image.length()) {
                 return ImageCheck(false, "Android sparse", "Invalid or truncated sparse chunk")
