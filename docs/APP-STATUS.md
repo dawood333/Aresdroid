@@ -9,6 +9,7 @@ The repository now contains an Android Studio application module:
 - Storage Access Framework GSI picker with private app-data staging, streaming SHA-256, Android sparse expansion, and filesystem detection for raw ext4/EROFS. It attempts a read-only metadata mount only inside a separate mount namespace; this is not a guest boot.
 - Small arm64 JNI library built with CMake. It reports successful native loading and runs no privileged commands.
 - Root-backed read-only Ares audit: identity/build properties, SELinux mode, self/init namespaces, Binder device visibility, init mount topology, `/data` free space and a non-mutating mount-namespace creation probe. The audit requests KernelSU approval through `su`; it does not change host state.
+- Root-backed read-only service inventory: Binder device/context visibility, Binder and HIDL service registrations, init service states, core Android process PIDs/mount namespaces/SELinux domains, watchdog identities/state, VINTF file layout and init mount snapshot. The script is bundled as an asset, output is bounded and drained concurrently, and no service or sysfs control is written.
 - Session-switch control is deliberately disabled.
 
 ## Build environment
@@ -30,7 +31,7 @@ The app requests no broad storage permissions, does not change SELinux, and does
 
 ## M0/M1 audit behavior
 
-The dashboard now has a **Run privileged Ares audit** action. It collects a bounded text report after the user approves the KernelSU prompt. Commands are fixed in the app; no arbitrary shell input is accepted. The only namespace operation is a child mount-namespace creation attempt (`unshare -m`) with no mount changes. A failed or unavailable probe is reported, not bypassed. The report is intended to decide the next Ares-specific M1 experiment; it is not evidence that pivot_root or Android guest startup works.
+The dashboard now has a **Run privileged Ares audit** action. It collects a bounded text report after the user approves the KernelSU prompt. Commands are fixed in the app; no arbitrary shell input is accepted. The only namespace operation is a child mount-namespace creation attempt (`unshare -m`) with no mount changes. A failed or unavailable probe is reported, not bypassed. The report is intended to decide the next Ares-specific M1 experiment; it is not evidence that pivot_root or Android guest startup works. A separate **Collect service and watchdog inventory** action runs the bundled read-only script and captures service-manager registrations, init service state, Binder/HIDL listings, core process ownership, watchdog metadata and VINTF layout. It never writes watchdog controls or changes service state.
 
 
 ## GSI intake implementation
