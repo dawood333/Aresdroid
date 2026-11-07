@@ -215,7 +215,7 @@ class MainActivity : ComponentActivity() {
                 }
                 scriptFile.setReadable(true, true)
                 scriptFile.setExecutable(true, true)
-                val command = "sh '\${scriptFile.absolutePath.replace("'", "'\\''")}'"
+                val command = "sh '${scriptFile.absolutePath.replace("'", "'\\''")}'"
                 val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
                 val output = StringBuilder()
                 val reader = Thread {
@@ -238,12 +238,12 @@ class MainActivity : ComponentActivity() {
                 } else {
                     reader.join(2000)
                     report = synchronized(output) { output.toString().take(24000) }
-                    if (process.exitValue() != 0) report += "\n[su exit=\${process.exitValue()}]"
+                    if (process.exitValue() != 0) report += "\n[su exit=${process.exitValue()}]"
                     if (report.isBlank()) report = "No inventory output was returned."
                 }
                 scriptFile.delete()
             } catch (error: Exception) {
-                report = "Could not collect inventory: \${error.javaClass.simpleName}: \${error.message}"
+                report = "Could not collect inventory: ${error.javaClass.simpleName}: ${error.message}"
             }
             runOnUiThread {
                 serviceInventoryStatus.text = report
@@ -522,10 +522,10 @@ class MainActivity : ComponentActivity() {
                 reader.join(2000)
                 val captured = synchronized(output) { output.toString().take(9000) }
                 if (process.exitValue() == 0) captured.ifBlank { "No metadata was found in the image." }
-                else "Read-only mount/inspection unavailable (exit \${process.exitValue()}):\n$captured"
+                else "Read-only mount/inspection unavailable (exit ${process.exitValue()}):\n$captured"
             }
         } catch (error: Exception) {
-            "Could not inspect image as root: \${error.javaClass.simpleName}: \${error.message}"
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
         }
         }
     }
