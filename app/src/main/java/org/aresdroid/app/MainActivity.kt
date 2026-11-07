@@ -99,6 +99,7 @@ class MainActivity : ComponentActivity() {
         image.addView(gsiStatus)
         image.addView(actionButton("Choose GSI image") { openGsi.launch(arrayOf("*/*")) })
         image.addView(actionButton("View staged images") { showStagedImages() })
+        image.addView(actionButton("Build guest session manifest") { createGuestSessionManifest() })
         image.addView(actionButton("Remove staged images") { confirmClearStagedImages() })
 
         content.addView(sectionTitle("RUNTIME"))
@@ -326,6 +327,35 @@ class MainActivity : ComponentActivity() {
             }
             runOnUiThread { gsiStatus.text = result }
         }.start()
+    }
+
+    private fun createGuestSessionManifest() {
+        val dir = File(filesDir, "gsi-staging")
+        val images = dir.listFiles { file -> file.isFile && file.extension == "img" }
+            ?.sortedByDescending { it.lastModified() }.orEmpty()
+        if (images.isEmpty()) {
+            gsiStatus.text = "Stage a valid system image before building the guest manifest."
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Select guest system image")
+            .setItems(images.map { it.name + " • " + formatSize(it.length()) }.toTypedArray()) { _, index ->
+                val selected = images[index]
+                gsiStatus.text = "Building SHA-256 verified guest session manifest…"
+                Thread {
+                    val report = try {
+                        val manifest = GuestSessionManifest.create(this, selected)
+                        "Guest session manifest created:\n" + manifest.absolutePath + "\n\n" +
+                            manifest.readText().take(12000) +
+                            "\n\nThis records the exact staged guest payload. It does not start Android or modify HyperOS."
+                    } catch (error: Exception) {
+                        "Could not create guest manifest: " + error.javaClass.simpleName + ": " + error.message
+                    }
+                    runOnUiThread { gsiStatus.text = report }
+                }.start()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showStagedImages() {
