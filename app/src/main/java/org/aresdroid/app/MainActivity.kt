@@ -244,6 +244,7 @@ class MainActivity : ComponentActivity() {
                     if (!raw.exists()) expandSparseImage(staged, raw, expandedBytes)
                     rawPath = raw.absolutePath
                 }
+                val imageInspection = inspectMountedGsi(rawPath, format.name)
                 result = buildString {
                     appendLine("GSI image staged successfully")
                     appendLine("Format: ${format.name}")
@@ -251,8 +252,12 @@ class MainActivity : ComponentActivity() {
                     appendLine("Expanded size: ${format.expandedSize?.let { formatSize(it) } ?: "Not applicable"}")
                     appendLine("SHA-256: $sha256")
                     appendLine("Source image: ${staged.absolutePath}")
-                    appendLine("Mountable raw candidate: $rawPath")
-                    append("Status: image structure checked and staged; Android compatibility and boot have not been tested.")
+                    appendLine("Raw system image: $rawPath")
+                    appendLine()
+                    appendLine("GSI metadata inspection:")
+                    append(imageInspection)
+                    appendLine()
+                    append("Status: filesystem inspection is read-only and isolated; no guest session was started.")
                 }
             } catch (error: Exception) {
                 result = "GSI validation failed: ${error.javaClass.simpleName}: ${error.message ?: "unknown error"}"
@@ -362,6 +367,61 @@ class MainActivity : ComponentActivity() {
         }
         val expanded = totalBlocks * blockSize
         return ImageCheck(true, "Android sparse image", "Sparse header and chunk table validated", expanded)
+    }
+
+    private fun inspectMountedGsi(imagePath: String, format: String): String {
+        val fsType = when (format) {
+            "Raw ext4" -> "ext4"
+            "Raw EROFS" -> "erofs"
+            "Android sparse image" -> "ext4"
+            else -> return "Unsupported filesystem type."
+        }
+        val mountDir = File(cacheDir, "gsi-inspect").apply { mkdirs() }
+        fun quote(value: String) = "'" + value.replace("'", "'\\''") + "'"
+        val script = """
+            set -eu
+            unshare -m sh -c '
+                set -eu
+                IMG="$1"
+                MNT="$2"
+                TYPE="$3"
+                mount --make-rprivate /
+                mkdir -p "$MNT"
+                cleanup() { umount "$MNT" >/dev/null 2>&1 || true; }
+                trap cleanup EXIT
+                if [ "$TYPE" = ext4 ]; then
+                    mount -t ext4 -o loop,ro,noload "$IMG" "$MNT"
+                else
+                    mount -t erofs -o loop,ro "$IMG" "$MNT"
+                fi
+                echo "mount=success"
+                for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do
+                    if [ -f "$MNT/$f" ]; then
+                        echo "=== $f ==="
+                        if [ "$f" = build.prop ]; then
+                            grep -E "^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=" "$MNT/$f" | head -n 40 || true
+                        else
+                            head -n 160 "$MNT/$f"
+                        fi
+                    else
+                        echo "missing=$f"
+                    fi
+                done
+            ' aresdroid \${quote(imagePath)} \${quote(mountDir.absolutePath)} \${quote(fsType)}
+        """.trimIndent()
+        return try {
+            val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                "Inspection timed out."
+            } else {
+                val output = process.inputStream.bufferedReader().use { it.readText() }.take(9000)
+                if (process.exitValue() == 0) output.ifBlank { "No metadata was found in the image." }
+                else "Read-only mount/inspection unavailable (exit ${process.exitValue()}):\n$output"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
     }
 
     private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
