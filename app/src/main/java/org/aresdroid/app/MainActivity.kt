@@ -1,6 +1,6 @@
 package org.aresdroid.app
 
-import android.app.Activity
+import androidx.activity.ComponentActivity
 import android.content.Intent
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -18,7 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
 import java.util.Locale
 
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
     private lateinit var gsiStatus: TextView
     private var nativeStatusText = "Native core not checked"
 
