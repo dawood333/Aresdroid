@@ -42,8 +42,10 @@ without flashing a second boot image.
 
 ## First test
 
+From the repository root (or after extracting the script), run:
+
 ```sh
-su -c 'sh ares-probe.sh'
+su -c 'sh scripts/ares-probe.sh'
 ```
 
 Copy the generated report back for review. The probe intentionally does not
