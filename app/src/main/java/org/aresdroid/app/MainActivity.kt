@@ -382,29 +382,29 @@ class MainActivity : ComponentActivity() {
             set -eu
             unshare -m sh -c '
                 set -eu
-                IMG="$1"
-                MNT="$2"
-                TYPE="$3"
+                IMG="${'$'}1"
+                MNT="${'$'}2"
+                TYPE="${'$'}3"
                 mount --make-rprivate /
-                mkdir -p "$MNT"
-                cleanup() { umount "$MNT" >/dev/null 2>&1 || true; }
+                mkdir -p "${'$'}MNT"
+                cleanup() { umount "${'$'}MNT" >/dev/null 2>&1 || true; }
                 trap cleanup EXIT
-                if [ "$TYPE" = ext4 ]; then
-                    mount -t ext4 -o loop,ro,noload "$IMG" "$MNT"
+                if [ "${'$'}TYPE" = ext4 ]; then
+                    mount -t ext4 -o loop,ro,noload "${'$'}IMG" "${'$'}MNT"
                 else
-                    mount -t erofs -o loop,ro "$IMG" "$MNT"
+                    mount -t erofs -o loop,ro "${'$'}IMG" "${'$'}MNT"
                 fi
                 echo "mount=success"
                 for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do
-                    if [ -f "$MNT/$f" ]; then
+                    if [ -f "${'$'}MNT/${'$'}f" ]; then
                         echo "=== $f ==="
                         if [ "$f" = build.prop ]; then
-                            grep -E "^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=" "$MNT/$f" | head -n 40 || true
+                            grep -E "^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=" "${'$'}MNT/${'$'}f" | head -n 40 || true
                         else
-                            head -n 160 "$MNT/$f"
+                            head -n 160 "${'$'}MNT/${'$'}f"
                         fi
                     else
-                        echo "missing=$f"
+                        echo "missing=${'$'}f"
                     fi
                 done
             ' aresdroid \${quote(imagePath)} \${quote(mountDir.absolutePath)} \${quote(fsType)}
