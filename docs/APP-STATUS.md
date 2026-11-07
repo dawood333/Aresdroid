@@ -7,6 +7,7 @@ The repository now contains an Android Studio application module:
 - Read-only device identity, Android SDK, kernel release, ABI and SELinux display.
 - Ares / MT6893 candidate check. This is a heuristic, not hardware attestation.
 - Storage Access Framework GSI picker with private app-data staging, streaming SHA-256, Android sparse expansion, and filesystem detection for raw ext4/EROFS. It attempts a read-only metadata mount only inside a separate mount namespace; this is not a guest boot.
+- Guest session manifest builder: selects a staged image, re-verifies its SHA-256 against the content-addressed filename, validates the raw payload filesystem, and writes `gsi-staging/guest-session.json` containing the exact guest payload hash/size, Ares MT6893 target, host fingerprint/API and explicit boot/recovery prerequisites. The manifest is not a bootable rootfs and does not enable switching.
 - Small arm64 JNI library built with CMake. It reports successful native loading and runs no privileged commands.
 - Root-backed read-only Ares audit: identity/build properties, SELinux mode, self/init namespaces, Binder device visibility, init mount topology, `/data` free space and a non-mutating mount-namespace creation probe. The audit requests KernelSU approval through `su`; it does not change host state.
 - Root-backed read-only service inventory: Binder device/context visibility, Binder and HIDL service registrations, init service states, core Android process PIDs/mount namespaces/SELinux domains, watchdog identities/state, VINTF file layout and init mount snapshot. The script is bundled as an asset, output is bounded and drained concurrently, and no service or sysfs control is written.
@@ -19,7 +20,7 @@ Open the repository in Android Studio with JDK 17, Android SDK Platform 36, Andr
 ## Not implemented
 
 - Persistent root command broker or privileged daemon (the audit uses one fixed, bounded `su -c` request only).
-- A complete guest image set and full Android GSI compatibility checks against Ares vendor/VINTF; the current read-only mount is only an inspection step.
+- A complete guest image set and full Android GSI compatibility checks against Ares vendor/VINTF; the manifest currently records one system image only and marks boot handoff unavailable until the guest ramdisk/root layout and vendor compatibility are supplied.
 - A disposable `pivot_root` test. The current audit proves mount-namespace creation only; the image inspector mounts a filesystem read-only in that isolated namespace but does not pivot the process root.
 - Binder/service-manager isolation or ownership handling.
 - Zygote or system_server control.
