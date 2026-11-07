@@ -28,6 +28,8 @@ class MainActivity : ComponentActivity() {
     private var nativeStatusText = "Native core not checked"
     private lateinit var auditStatus: TextView
     private var auditRunning = false
+    private lateinit var serviceInventoryStatus: TextView
+    private var inventoryRunning = false
 
     private val openGsi = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri != null) {
@@ -106,6 +108,9 @@ class MainActivity : ComponentActivity() {
         runtime.addView(actionButton("Run privileged Ares audit") { runAresAudit() })
         auditStatus = label("Audit not run yet. Tap the button and approve the KernelSU prompt.")
         runtime.addView(auditStatus)
+        runtime.addView(actionButton("Collect service and watchdog inventory") { runServiceInventory() })
+        serviceInventoryStatus = label("Service ownership inventory not collected yet.")
+        runtime.addView(serviceInventoryStatus)
         runtime.addView(Button(this).apply {
             text = "Switch Android session — locked"
             isEnabled = false
@@ -193,6 +198,56 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 auditStatus.text = report
                 auditRunning = false
+            }
+        }.start()
+    }
+
+    private fun runServiceInventory() {
+        if (inventoryRunning) return
+        inventoryRunning = true
+        serviceInventoryStatus.text = "Collecting read-only Binder, Android service and watchdog inventory…"
+        Thread {
+            var report: String
+            try {
+                val scriptFile = File(cacheDir, "ares-service-inventory.sh")
+                assets.open("ares-service-inventory.sh").use { input ->
+                    scriptFile.outputStream().use { output -> input.copyTo(output) }
+                }
+                scriptFile.setReadable(true, true)
+                scriptFile.setExecutable(true, true)
+                val command = "sh '\${scriptFile.absolutePath.replace("'", "'\\''")}'"
+                val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
+                val output = StringBuilder()
+                val reader = Thread {
+                    runCatching {
+                        process.inputStream.bufferedReader().useLines { lines ->
+                            lines.forEach { line ->
+                                synchronized(output) {
+                                    if (output.length < 24000) output.append(line).append('\n')
+                                }
+                            }
+                        }
+                    }
+                }.apply { isDaemon = true; start() }
+                val completed = process.waitFor(45, TimeUnit.SECONDS)
+                if (!completed) {
+                    process.destroyForcibly()
+                    process.waitFor(2, TimeUnit.SECONDS)
+                    reader.join(2000)
+                    report = "Inventory timed out after 45 seconds."
+                } else {
+                    reader.join(2000)
+                    report = synchronized(output) { output.toString().take(24000) }
+                    if (process.exitValue() != 0) report += "\n[su exit=\${process.exitValue()}]"
+                    if (report.isBlank()) report = "No inventory output was returned."
+                }
+                scriptFile.delete()
+            } catch (error: Exception) {
+                report = "Could not collect inventory: \${error.javaClass.simpleName}: \${error.message}"
+            }
+            runOnUiThread {
+                serviceInventoryStatus.text = report
+                inventoryRunning = false
             }
         }.start()
     }
