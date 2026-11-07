@@ -444,46 +444,29 @@ class MainActivity : ComponentActivity() {
         }
         val mountDir = File(cacheDir, "gsi-inspect").apply { mkdirs() }
         fun quote(value: String) = "'" + value.replace("'", "'\\''") + "'"
-        val script = """
-            set -eu
-            unshare -m sh -c '
-                set -eu
-                IMG="${'$'}1"
-                MNT="${'$'}2"
-                TYPE="${'$'}3"
-                mount --make-rprivate /
-                mkdir -p "${'$'}MNT"
-                cleanup() { umount "${'$'}MNT" >/dev/null 2>&1 || true; }
-                trap cleanup EXIT
-                if [ "${'$'}TYPE" = ext4 ]; then
-                    mount -t ext4 -o loop,ro,noload "${'$'}IMG" "${'$'}MNT"
-                else
-                    mount -t erofs -o loop,ro "${'$'}IMG" "${'$'}MNT"
-                fi
-                echo "mount=success"
-                for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do
-                    if [ -f "${'$'}MNT/${'$'}f" ]; then
-                        echo "=== ${'$'}f ==="
-                        if [ "${'$'}f" = build.prop ]; then
-                            grep -E "^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=" "${'$'}MNT/${'$'}f" | head -n 40 || true
-                        else
-                            head -n 160 "${'$'}MNT/${'$'}f"
-                        fi
-                    else
-                        echo "missing=${'$'}f"
-                    fi
-                done
-            ' aresdroid ${quote(imagePath)} ${quote(mountDir.absolutePath)} ${quote(fsType)}
-        """.trimIndent()
+        val inner = listOf(
+            "set -eu",
+            "IMG=\"@@{'$'}1\"",
+            "MNT=\"@@{'$'}2\"",
+            "TYPE=\"@@{'$'}3\"",
+            "mount --make-rprivate /",
+            "mkdir -p \"@@{'$'}MNT\"",
+            "trap 'umount \"@@{'$'}MNT\" >/dev/null 2>&1 || true' EXIT",
+            "if [ \"@@{'$'}TYPE\" = ext4 ]; then mount -t ext4 -o loop,ro,noload \"@@{'$'}IMG\" \"@@{'$'}MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
         return try {
             val rootResult = runRootScript(script, 30, 9000)
             when {
-                rootResult.timedOut -> "Inspection timed out.\n${rootResult.output}"
+                rootResult.timedOut -> "Inspection timed out.\\n@@{rootResult.output}"
                 rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
-                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\n${rootResult.output}"
+                else -> "Read-only mount/inspection unavailable (exit @@{rootResult.exitCode}):\\n@@{rootResult.output}"
             }
         } catch (error: Exception) {
-            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+            "Could not inspect image as root: @@{error.javaClass.simpleName}: @@{error.message}"
         }
     }
 
