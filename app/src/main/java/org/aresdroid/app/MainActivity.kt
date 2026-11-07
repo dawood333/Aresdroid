@@ -446,7 +446,7 @@ class MainActivity : ComponentActivity() {
         fun quote(value: String) = "'" + value.replace("'", "'\\''") + "'"
         val inner = listOf(
             "set -eu",
-            "IMG=\"@@{'$'}1\"",
+            "IMG=\"${'1\"",
             "MNT=\"@@{'$'}2\"",
             "TYPE=\"@@{'$'}3\"",
             "mount --make-rprivate /",
@@ -461,12 +461,4116 @@ class MainActivity : ComponentActivity() {
         return try {
             val rootResult = runRootScript(script, 30, 9000)
             when {
-                rootResult.timedOut -> "Inspection timed out.\\n@@{rootResult.output}"
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
                 rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
-                else -> "Read-only mount/inspection unavailable (exit @@{rootResult.exitCode}):\\n@@{rootResult.output}"
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
             }
         } catch (error: Exception) {
-            "Could not inspect image as root: @@{error.javaClass.simpleName}: @@{error.message}"
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}1\"",
+            "MNT=\"${'2\"",
+            "TYPE=\"@@{'$'}3\"",
+            "mount --make-rprivate /",
+            "mkdir -p \"@@{'$'}MNT\"",
+            "trap 'umount \"@@{'$'}MNT\" >/dev/null 2>&1 || true' EXIT",
+            "if [ \"@@{'$'}TYPE\" = ext4 ]; then mount -t ext4 -o loop,ro,noload \"@@{'$'}IMG\" \"@@{'$'}MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}2\"",
+            "TYPE=\"${'3\"",
+            "mount --make-rprivate /",
+            "mkdir -p \"@@{'$'}MNT\"",
+            "trap 'umount \"@@{'$'}MNT\" >/dev/null 2>&1 || true' EXIT",
+            "if [ \"@@{'$'}TYPE\" = ext4 ]; then mount -t ext4 -o loop,ro,noload \"@@{'$'}IMG\" \"@@{'$'}MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}3\"",
+            "mount --make-rprivate /",
+            "mkdir -p \"${'MNT\"",
+            "trap 'umount \"@@{'$'}MNT\" >/dev/null 2>&1 || true' EXIT",
+            "if [ \"@@{'$'}TYPE\" = ext4 ]; then mount -t ext4 -o loop,ro,noload \"@@{'$'}IMG\" \"@@{'$'}MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}MNT\"",
+            "trap 'umount \"${'MNT\" >/dev/null 2>&1 || true' EXIT",
+            "if [ \"@@{'$'}TYPE\" = ext4 ]; then mount -t ext4 -o loop,ro,noload \"@@{'$'}IMG\" \"@@{'$'}MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}MNT\" >/dev/null 2>&1 || true' EXIT",
+            "if [ \"${'TYPE\" = ext4 ]; then mount -t ext4 -o loop,ro,noload \"@@{'$'}IMG\" \"@@{'$'}MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}TYPE\" = ext4 ]; then mount -t ext4 -o loop,ro,noload \"${'IMG\" \"@@{'$'}MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}IMG\" \"${'MNT\"; else mount -t erofs -o loop,ro \"@@{'$'}IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}MNT\"; else mount -t erofs -o loop,ro \"${'IMG\" \"@@{'$'}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}IMG\" \"${'MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"@@{'$'}MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}MNT\"; fi",
+            "echo mount=success",
+            "for f in build.prop etc/vintf/manifest.xml etc/vintf/compatibility_matrix.xml; do if [ -f \"${'MNT/@@{'$'}f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}MNT/${'f\" ]; then echo \"=== @@{'$'}f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}f\" ]; then echo \"=== ${'f ===\"; if [ \"@@{'$'}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}f ===\"; if [ \"${'f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"@@{'$'}MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}f\" = build.prop ]; then grep -E '^(ro\\.build\\.version\\.(release|sdk)|ro\\.product\\.cpu\\.abi|ro\\.vndk\\.version|ro\\.product\\.device|ro\\.product\\.name)=' \"${'MNT/@@{'$'}f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}MNT/${'f\" | head -n 40 || true; else head -n 160 \"@@{'$'}MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}f\" | head -n 40 || true; else head -n 160 \"${'MNT/@@{'$'}f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}MNT/${'f\"; fi; else echo \"missing=@@{'$'}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}f\"; fi; else echo \"missing=${'f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
+    }
+
+    private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
+        RandomAccessFile(source, "r").use { input ->
+            RandomAccessFile(destination, "rw").use { output ->
+                output.setLength(expandedBytes)
+                val fileHeaderSize = readLeShort(input, 8)
+                val chunkHeaderSize = readLeShort(input, 10)
+                val blockSize = readLeInt(input, 12).toLong() and 0xFFFFFFFFL
+                val totalChunks = readLeInt(input, 20).toLong() and 0xFFFFFFFFL
+                var sourceOffset = fileHeaderSize.toLong()
+                var outputOffset = 0L
+                val buffer = ByteArray(128 * 1024)
+                repeat(totalChunks.toInt()) {
+                    input.seek(sourceOffset)
+                    val type = readLeShort(input, sourceOffset)
+                    val blocks = readLeInt(input, sourceOffset + 4).toLong() and 0xFFFFFFFFL
+                    val totalSize = readLeInt(input, sourceOffset + 8).toLong() and 0xFFFFFFFFL
+                    val payloadOffset = sourceOffset + chunkHeaderSize
+                    val outputBytes = blocks * blockSize
+                    when (type) {
+                        0xCAC1 -> {
+                            input.seek(payloadOffset)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            while (left > 0) {
+                                val n = input.read(buffer, 0, minOf(buffer.size.toLong(), left).toInt())
+                                if (n <= 0) throw IllegalArgumentException("Truncated RAW sparse chunk")
+                                output.write(buffer, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC2 -> {
+                            input.seek(payloadOffset)
+                            val pattern = ByteArray(4)
+                            input.readFully(pattern)
+                            output.seek(outputOffset)
+                            var left = outputBytes
+                            val fill = ByteArray(128 * 1024)
+                            for (i in fill.indices) fill[i] = pattern[i % 4]
+                            while (left > 0) {
+                                val n = minOf(fill.size.toLong(), left).toInt()
+                                output.write(fill, 0, n)
+                                left -= n
+                            }
+                        }
+                        0xCAC3 -> Unit // DONT_CARE: pre-sized output remains sparse/zero-filled.
+                        0xCAC4 -> Unit // CRC32 chunk: validated above, no output bytes.
+                        else -> throw IllegalArgumentException("Unsupported sparse chunk")
+                    }
+                    if (type != 0xCAC4) outputOffset += outputBytes
+                    sourceOffset += totalSize
+                }
+                if (outputOffset != expandedBytes) throw IllegalArgumentException("Expanded image size mismatch")
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        if (a < 0 || b < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8)
+    }
+
+    private fun readLeShort(file: RandomAccessFile, offset: Int): Int = readLeShort(file, offset.toLong())
+
+    private fun readLeInt(file: RandomAccessFile, offset: Long): Int {
+        file.seek(offset)
+        val a = file.read()
+        val b = file.read()
+        val c = file.read()
+        val d = file.read()
+        if (a < 0 || b < 0 || c < 0 || d < 0) throw IllegalArgumentException("Unexpected end of image")
+        return a or (b shl 8) or (c shl 16) or (d shl 24)
+    }
+
+    private fun readLeInt(file: RandomAccessFile, offset: Int): Int = readLeInt(file, offset.toLong())
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format(Locale.ROOT, "%.2f MB", mb)
+        return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0)
+    }
+
+    private fun aresTargetStatus(): String {
+        val device = Build.DEVICE.lowercase(Locale.ROOT)
+        val hardware = Build.HARDWARE.lowercase(Locale.ROOT)
+        return if (device == "ares" || hardware.contains("mt6893")) {
+            "Ares / MT6893 candidate"
+        } else "Unverified device (expected ares / MT6893)"
+    }
+
+    private fun readSelinuxState(): String = try {
+        when (File("/sys/fs/selinux/enforce").readText().trim()) {
+            "1" -> "Enforcing"
+            "0" -> "Permissive"
+            else -> "Unknown"
+        }
+    } catch (_: Exception) { "Unavailable" }
+
+    private fun card(parent: LinearLayout) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            setColor(0xFF1A2334.toInt())
+            cornerRadius = dp(16).toFloat()
+        }
+        parent.addView(this, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(4)
+        })
+    }
+
+    private fun sectionTitle(value: String) = TextView(this).apply {
+        text = value
+        textSize = 11f
+        letterSpacing = 0.14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(0xFF91A6CC.toInt())
+        setPadding(2, dp(22), 0, dp(10))
+    }
+
+    private fun label(value: String) = TextView(this).apply {
+        text = value
+        textSize = 13f
+        setTextColor(0xFFB8C4D9.toInt())
+        setPadding(0, dp(5), 0, dp(7))
+    }
+
+    private fun valueRow(name: String, value: String) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(5), 0, dp(7))
+        addView(TextView(this@MainActivity).apply {
+            text = name
+            textSize = 11f
+            setTextColor(0xFF8192B1.toInt())
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = value.ifBlank { "Unknown" }
+            textSize = 14f
+            setTextColor(0xFFF0F3FA.toInt())
+        })
+    }
+
+    private fun actionButton(value: String, action: () -> Unit) = Button(this).apply {
+        text = value
+        isAllCaps = false
+        setOnClickListener { action() }
+    }
+
+    private fun formatSize(bytes: Long?): String {
+        if (bytes == null || bytes < 0) return "Unknown"
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(Locale.ROOT, "%.1f KB", kb)
+        return String.format(Locale.ROOT, "%.2f MB", kb / 1024.0)
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+}
+}f\"; fi; done"
+        ).joinToString("; ")
+        val script = "unshare -m sh -c " + quote(inner) + " aresdroid " +
+            quote(imagePath) + " " + quote(mountDir.absolutePath) + " " + quote(fsType)
+        return try {
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\\n${rootResult.output}"
+            }
+        } catch (error: Exception) {
+            "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
         }
     }
 
