@@ -177,15 +177,11 @@ class MainActivity : ComponentActivity() {
             """.trimIndent()
             var report: String
             try {
-                val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
-                val completed = process.waitFor(25, TimeUnit.SECONDS)
-                if (!completed) {
-                    process.destroyForcibly()
-                    report = "Root audit timed out after 25 seconds."
-                } else {
-                    report = process.inputStream.bufferedReader().use { it.readText() }
-                    if (report.length > 14000) report = report.take(14000) + "\n[output truncated]"
-                    if (process.exitValue() != 0) report += "\n[su exit=${process.exitValue()}]"
+                val rootResult = runRootScript(script, 25, 14000)
+                report = when {
+                    rootResult.timedOut -> "Root audit timed out after 25 seconds.\n${rootResult.output}"
+                    rootResult.exitCode != 0 -> rootResult.output + "\n[su exit=${rootResult.exitCode}]"
+                    else -> rootResult.output
                 }
             } catch (error: Exception) {
                 report = "Could not start root audit: ${error.javaClass.simpleName}: ${error.message}"
@@ -435,18 +431,50 @@ class MainActivity : ComponentActivity() {
             ' aresdroid ${quote(imagePath)} ${quote(mountDir.absolutePath)} ${quote(fsType)}
         """.trimIndent()
         return try {
-            val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
-            if (!process.waitFor(30, TimeUnit.SECONDS)) {
-                process.destroyForcibly()
-                "Inspection timed out."
-            } else {
-                val output = process.inputStream.bufferedReader().use { it.readText() }.take(9000)
-                if (process.exitValue() == 0) output.ifBlank { "No metadata was found in the image." }
-                else "Read-only mount/inspection unavailable (exit ${process.exitValue()}):\n$output"
+            val rootResult = runRootScript(script, 30, 9000)
+            when {
+                rootResult.timedOut -> "Inspection timed out.\n${rootResult.output}"
+                rootResult.exitCode == 0 -> rootResult.output.ifBlank { "No metadata was found in the image." }
+                else -> "Read-only mount/inspection unavailable (exit ${rootResult.exitCode}):\n${rootResult.output}"
             }
         } catch (error: Exception) {
             "Could not inspect image as root: ${error.javaClass.simpleName}: ${error.message}"
         }
+    }
+
+    private data class RootScriptResult(
+        val output: String,
+        val exitCode: Int,
+        val timedOut: Boolean
+    )
+
+    private fun runRootScript(script: String, timeoutSeconds: Long, maxChars: Int): RootScriptResult {
+        val process = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    synchronized(output) {
+                        if (output.length < maxChars) {
+                            val remaining = maxChars - output.length
+                            output.append(line.take(remaining))
+                            if (output.length < maxChars) output.append('\n')
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val completed = process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        if (!completed) {
+            process.destroyForcibly()
+            process.waitFor()
+        }
+        reader.join(2000)
+        val captured = synchronized(output) {
+            output.toString() + if (output.length >= maxChars) "\n[output truncated]" else ""
+        }
+        return RootScriptResult(captured, if (completed) process.exitValue() else -1, !completed)
     }
 
     private fun expandSparseImage(source: File, destination: File, expandedBytes: Long) {
