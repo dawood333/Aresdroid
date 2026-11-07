@@ -12,7 +12,7 @@ The repository now contains an Android Studio application module:
 
 ## Build environment
 
-Open the repository in Android Studio with JDK 17, Android SDK Platform 36, Android NDK and CMake 3.22.1. The project uses Android Gradle Plugin 8.7.3 and Kotlin 2.0.21. Gradle 8.9 is required. A Gradle wrapper is not included yet.
+Open the repository in Android Studio with JDK 17, Android SDK Platform 36, Android NDK and CMake 3.22.1. The project uses Android Gradle Plugin 8.10.0, Kotlin 2.0.21 and Gradle 8.11.1. A Gradle wrapper is not included yet.
 
 ## Not implemented
 
