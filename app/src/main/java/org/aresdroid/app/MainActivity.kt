@@ -164,6 +164,29 @@ class MainActivity : ComponentActivity() {
                 grep -E 'binder|binderfs' /proc/1/mountinfo 2>/dev/null | head -n 20
                 echo '[mount-propagation]'
                 grep -E ' /data | / | /dev ' /proc/1/mountinfo 2>/dev/null | head -n 20
+                echo '[android-service-ownership]'
+                for svc in servicemanager hwservicemanager vndservicemanager vold installd keystore2 gatekeeperd surfaceflinger zygote zygote_secondary system_server netd audioserver cameraserver; do
+                    printf '%s state=' "$svc"
+                    getprop "init.svc.$svc" 2>/dev/null
+                    printf '%s pid=' "$svc"
+                    getprop "init.svc_debug_pid.$svc" 2>/dev/null
+                done
+                echo '[service-manager-names]'
+                service list 2>&1 | head -n 100
+                echo '[hardware-service-managers]'
+                if command -v lshal >/dev/null 2>&1; then lshal 2>&1 | head -n 100; else echo 'lshal: unavailable'; fi
+                echo '[critical-processes]'
+                ps -A -o PID,PPID,USER,NAME 2>&1 | grep -E '(^ *PID|servicemanager|hwservicemanager|vndservicemanager|vold|installd|keystore|gatekeeper|surfaceflinger|zygote|system_server|netd|audioserver|cameraserver)' | head -n 100
+                echo '[watchdog-inventory-read-only]'
+                for node in /sys/class/watchdog/watchdog*; do
+                    [ -e "$node" ] || continue
+                    echo "node=$node"
+                    for attr in identity state status timeout timeleft bootstatus nowayout; do
+                        [ -r "$node/$attr" ] && printf '%s=' "$attr" && cat "$node/$attr" 2>/dev/null
+                    done
+                    [ -r "$node/dev" ] && printf 'dev=' && cat "$node/dev"
+                done
+                ls -l /dev/watchdog* /dev/softdog 2>&1
                 echo '[storage]'
                 df -h /data 2>&1
                 echo '[isolated-mount-namespace-test]'
