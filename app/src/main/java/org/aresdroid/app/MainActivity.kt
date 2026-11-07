@@ -179,11 +179,12 @@ class MainActivity : ComponentActivity() {
                 ps -A -o PID,PPID,USER,NAME 2>&1 | grep -E '(^ *PID|servicemanager|hwservicemanager|vndservicemanager|vold|installd|keystore|gatekeeper|surfaceflinger|zygote|system_server|netd|audioserver|cameraserver)' | head -n 100
                 echo '[watchdog-inventory-read-only]'
                 for node in /sys/class/watchdog/watchdog*; do
-                    [ -e "$node" ] || continue
-                    echo "node=${'                    for attr in identity state status timeout timeleft bootstatus nowayout; do
-                        [ -r "${' '%s=' "$attr" && cat "${' 2>/dev/null
+                    [ -e "${'$'}node" ] || continue
+                    echo "node=${'$'}node"
+                    for attr in identity state status timeout timeleft bootstatus nowayout; do
+                        [ -r "${'$'}node/${'$'}attr" ] && printf '%s=' "${'$'}attr" && cat "${'$'}node/${'$'}attr" 2>/dev/null
                     done
-                    [ -r "$node/dev" ] && printf 'dev=' && cat "$node/dev"
+                    [ -r "${'$'}node/dev" ] && printf 'dev=' && cat "${'$'}node/dev"
                 done
                 ls -l /dev/watchdog* /dev/softdog 2>&1
                 echo '[storage]'
