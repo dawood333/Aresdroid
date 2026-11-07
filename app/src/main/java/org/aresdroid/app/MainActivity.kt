@@ -351,23 +351,39 @@ class MainActivity : ComponentActivity() {
             val type = readLeShort(image, offset)
             val chunkBlocks = readLeInt(image, offset + 4).toLong() and 0xFFFFFFFFL
             val totalSize = readLeInt(image, offset + 8).toLong() and 0xFFFFFFFFL
-            val payload = when (type) {
-                0xCAC1 -> chunkBlocks * blockSize
-                0xCAC2 -> 4L
-                0xCAC3 -> 0L
-                0xCAC4 -> 4L
-                else -> return ImageCheck(false, "Android sparse", "Unknown sparse chunk type 0x${type.toString(16)}")
+            val payload = try {
+                when (type) {
+                    0xCAC1 -> Math.multiplyExact(chunkBlocks, blockSize)
+                    0xCAC2 -> 4L
+                    0xCAC3 -> 0L
+                    0xCAC4 -> 4L
+                    else -> return ImageCheck(false, "Android sparse", "Unknown sparse chunk type 0x${type.toString(16)}")
+                }
+            } catch (_: ArithmeticException) {
+                return ImageCheck(false, "Android sparse", "Sparse chunk size overflows 64-bit bounds")
             }
-            if (totalSize != chunkHeaderSize + payload || offset + totalSize > image.length()) {
+            val expectedSize = try { Math.addExact(chunkHeaderSize.toLong(), payload) } catch (_: ArithmeticException) {
+                return ImageCheck(false, "Android sparse", "Sparse chunk size overflows 64-bit bounds")
+            }
+            val nextOffset = try { Math.addExact(offset, totalSize) } catch (_: ArithmeticException) {
+                return ImageCheck(false, "Android sparse", "Sparse file offset overflows 64-bit bounds")
+            }
+            if (totalSize != expectedSize || nextOffset > image.length()) {
                 return ImageCheck(false, "Android sparse", "Invalid or truncated sparse chunk")
             }
-            if (type != 0xCAC4) blocksSeen += chunkBlocks
-            offset += totalSize
+            if (type != 0xCAC4) {
+                blocksSeen = try { Math.addExact(blocksSeen, chunkBlocks) } catch (_: ArithmeticException) {
+                    return ImageCheck(false, "Android sparse", "Sparse block count overflows 64-bit bounds")
+                }
+            }
+            offset = nextOffset
         }
         if (blocksSeen != totalBlocks || offset != image.length()) {
             return ImageCheck(false, "Android sparse", "Sparse chunk table does not match header or file length")
         }
-        val expanded = totalBlocks * blockSize
+        val expanded = try { Math.multiplyExact(totalBlocks, blockSize) } catch (_: ArithmeticException) {
+            return ImageCheck(false, "Android sparse", "Expanded image size overflows 64-bit bounds")
+        }
         return ImageCheck(true, "Android sparse image", "Sparse header and chunk table validated", expanded)
     }
 
