@@ -146,8 +146,8 @@ class MainActivity : ComponentActivity() {
                 cat /sys/fs/selinux/enforce 2>/dev/null || echo unavailable
                 echo '[namespaces]'
                 for ns in mnt pid ipc net uts user cgroup; do
-                    printf '%s self=' "${'; readlink "/proc/self/ns/$ns" 2>/dev/null || echo unavailable
-                    printf '%s init=' "$ns"; readlink "/proc/1/ns/$ns" 2>/dev/null || echo unavailable
+                    printf '%s self=' "${'$'}ns"; readlink "/proc/self/ns/${'$'}ns" 2>/dev/null || echo unavailable
+                    printf '%s init=' "${'$'}ns"; readlink "/proc/1/ns/${'$'}ns" 2>/dev/null || echo unavailable
                 done
                 echo '[namespace-tools]'
                 command -v unshare 2>/dev/null || echo 'unshare: unavailable'
