@@ -7,6 +7,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.security.MessageDigest
+import java.nio.file.Files
 import java.util.Date
 
 /**
@@ -115,9 +116,6 @@ object GuestSessionManifest {
     }
 
     private object FilesCompat {
-        fun isSymlink(file: File): Boolean {
-            val canonical = file.canonicalFile
-            return canonical.absolutePath != file.absoluteFile.normalize().path
-        }
+        fun isSymlink(file: File): Boolean = Files.isSymbolicLink(file.toPath())
     }
 }
